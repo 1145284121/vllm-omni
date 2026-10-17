@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import vllm.envs as vllm_envs
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import RMSNorm
 from vllm.logger import init_logger
@@ -37,7 +36,11 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
-from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+from vllm_omni.diffusion.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+    vllm_batch_invariant_scope,
+)
 from vllm_omni.diffusion.layers.exact_bf16_pointwise import eligible as pointwise_eligible
 from vllm_omni.diffusion.layers.exact_bf16_pointwise import residual, rotary, silu_mul
 from vllm_omni.diffusion.layers.exact_bf16_qk_norm_rope import qk_rotary
@@ -90,23 +93,10 @@ def _paged_kv_fp32_matmul_reduction(enabled: bool):
         matmul.allow_bf16_reduced_precision_reduction = prev
 
 
-@contextmanager
-def _vllm_batch_invariant_scope(enabled: bool):
-    if not enabled:
-        yield
-        return
-    previous = bool(vllm_envs.VLLM_BATCH_INVARIANT)
-    vllm_envs.VLLM_BATCH_INVARIANT = True
-    try:
-        yield
-    finally:
-        vllm_envs.VLLM_BATCH_INVARIANT = previous
-
-
 def _batch_invariant_forward(forward):
     @wraps(forward)
     def wrapped(self, *args, **kwargs):
-        with _vllm_batch_invariant_scope(getattr(self, "_batch_invariant_paged_hsdp_ulysses", False)):
+        with vllm_batch_invariant_scope(getattr(self, "_batch_invariant_paged_hsdp_ulysses", False)):
             return forward(self, *args, **kwargs)
 
     return wrapped

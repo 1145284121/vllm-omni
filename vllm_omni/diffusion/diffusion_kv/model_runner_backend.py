@@ -5,12 +5,10 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Mapping, Sequence
-from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
 import torch
-import vllm.envs as vllm_envs
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed import get_dcp_group
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
@@ -34,24 +32,12 @@ from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionRowBinding,
     DiffusionPagedAttentionRuntime,
 )
+from vllm_omni.diffusion.forward_context import vllm_batch_invariant_scope
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.platforms import current_omni_platform
 
 DiffusionKVIdentity = tuple[str, int | None, str | None]
 DiffusionKVSnapshot = tuple[object, ...]
-
-
-@contextmanager
-def _batch_invariant_scope(enabled: bool):
-    if not enabled:
-        yield
-        return
-    previous = bool(vllm_envs.VLLM_BATCH_INVARIANT)
-    vllm_envs.VLLM_BATCH_INVARIANT = True
-    try:
-        yield
-    finally:
-        vllm_envs.VLLM_BATCH_INVARIANT = previous
 
 
 @dataclass(frozen=True)
@@ -138,7 +124,7 @@ class DiffusionKVModelRunnerBackend:
         adapters: dict[str, DiffusionPagedAttentionLayerAdapter] = {}
         try:
             with (
-                _batch_invariant_scope(self._batch_invariant_paged_attention),
+                vllm_batch_invariant_scope(self._batch_invariant_paged_attention),
                 set_current_vllm_config(self.vllm_config),
             ):
                 for layer_name, (layer, spec) in layers.items():

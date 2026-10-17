@@ -9,7 +9,6 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 import torch
-import vllm.envs as vllm_envs
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.utils.math_utils import cdiv
@@ -25,7 +24,10 @@ from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
     PagedPiecewisePlan,
     build_paged_piecewise_plan,
 )
-from vllm_omni.diffusion.forward_context import override_paged_kv_adapter
+from vllm_omni.diffusion.forward_context import (
+    override_paged_kv_adapter,
+    vllm_batch_invariant_scope,
+)
 from vllm_omni.platforms import current_omni_platform
 
 
@@ -42,19 +44,6 @@ DiffusionKVRowResolver = Callable[
     [str, int | None, str | None],
     DiffusionPagedAttentionRowBinding,
 ]
-
-
-@contextmanager
-def _batch_invariant_scope(enabled: bool):
-    if not enabled:
-        yield
-        return
-    previous = bool(vllm_envs.VLLM_BATCH_INVARIANT)
-    vllm_envs.VLLM_BATCH_INVARIANT = True
-    try:
-        yield
-    finally:
-        vllm_envs.VLLM_BATCH_INVARIANT = previous
 
 
 class DiffusionPagedAttentionLayerAdapter(AttentionLayerBase):
@@ -492,7 +481,7 @@ class DiffusionPagedAttentionAdapter:
                 cp_kv_cache_interleave_size=self.block_tables.cp_interleave,
             )
         with (
-            _batch_invariant_scope(self.batch_invariant),
+            vllm_batch_invariant_scope(self.batch_invariant),
             set_current_vllm_config(self.vllm_config),
         ):
             return current_omni_platform.build_diffusion_kv_attn_metadata(
