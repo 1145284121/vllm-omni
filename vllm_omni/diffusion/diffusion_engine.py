@@ -991,9 +991,11 @@ class DiffusionEngine:
 
         try:
             if task.method == "pause_scheduler":
-                result = self._run_pause_barrier(remaining)
+                self._run_pause_barrier(remaining)
+                result = None
             elif task.method == "resume_scheduler":
-                result = self._open_scheduling_gate()
+                self._open_scheduling_gate()
+                result = None
             else:
                 result = self.executor.collective_rpc(
                     method=task.method,

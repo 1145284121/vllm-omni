@@ -7,11 +7,13 @@ import math
 from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import Mock
 
 import numpy as np
 import pytest
 import torch
+from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.worker import block_table as native_block_table
 
@@ -186,12 +188,12 @@ class _FakeBlockTables:
 
     def __init__(self, **kwargs: object) -> None:
         self.kwargs = kwargs
-        self.block_sizes = list(kwargs["block_sizes"])
-        self.max_num_reqs = int(kwargs["max_num_reqs"])
-        self.max_num_batched_tokens = int(kwargs["max_num_batched_tokens"])
-        self.cp_size = int(kwargs["cp_size"])
-        self.cp_rank = int(kwargs["cp_rank"])
-        self.cp_interleave = int(kwargs["cp_interleave"])
+        self.block_sizes = list(cast(list[int], kwargs["block_sizes"]))
+        self.max_num_reqs = int(cast(int, kwargs["max_num_reqs"]))
+        self.max_num_batched_tokens = int(cast(int, kwargs["max_num_batched_tokens"]))
+        self.cp_size = int(cast(int, kwargs["cp_size"]))
+        self.cp_rank = int(cast(int, kwargs["cp_rank"]))
+        self.cp_interleave = int(cast(int, kwargs["cp_interleave"]))
         self.blocks_per_kv_block = [1] * len(self.block_sizes)
         self.block_tables = [_FakeStagedTable() for _ in self.block_sizes]
         self.num_blocks = _FakeNumBlocks(len(self.block_sizes), self.max_num_reqs)
@@ -496,6 +498,28 @@ def test_valid_sequence_and_context_install_into_native_rows(monkeypatch: pytest
     )
 
 
+def test_partial_hit_copies_boundary_block_once_before_install(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner, _, _ = _runner(monkeypatch)
+    cache = torch.arange(32 * 8, dtype=torch.int64).view(32, 8)
+    runner.kv_caches = [cache]
+    source_before = cache[1].clone()
+    unrelated_before = cache[10].clone()
+    block_copies = (KVCacheBlockCopy(src_block_id=1, dst_block_id=9),)
+    metadata = replace(_metadata(), block_copies=block_copies)
+
+    assert runner.install_diffusion_kv_metadata(metadata) is True
+    assert torch.equal(cache[9], source_before)
+    assert torch.equal(cache[1], source_before)
+    assert torch.equal(cache[10], unrelated_before)
+
+    # Simulate the changed suffix overwriting only the private destination.
+    cache[9, 3:] = -1
+    assert runner.install_diffusion_kv_metadata(metadata) is False
+    assert torch.equal(cache[9, :3], source_before[:3])
+    assert torch.equal(cache[9, 3:], torch.full_like(cache[9, 3:], -1))
+    assert torch.equal(cache[1], source_before)
+
+
 def test_block_table_mutations_invalidate_prepared_attention_batches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -595,6 +619,7 @@ def test_generation_is_idempotent_stale_safe_and_conflict_safe(monkeypatch: pyte
         (_metadata(sequence_block_ids=([1, 2, 3],)), "block groups"),
         (_metadata(sequence_block_ids=([1, 2], [4, 5])), "expected 3"),
         (_metadata(sequence_block_ids=([1, 2, 32], [4, 5])), "outside"),
+        (replace(_metadata(), block_copies=(KVCacheBlockCopy(1, 32),)), "block copy"),
         (
             _metadata(
                 seq_len=17,

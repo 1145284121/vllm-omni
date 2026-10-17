@@ -11,7 +11,6 @@ import numpy as np
 import PIL.Image
 import torch
 from transformers import AutoTokenizer
-from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
 
 from vllm_omni.diffusion.diffusion_kv.kv_cache_utils import get_cache_namespace, hash_prefix_cache_value
 from vllm_omni.diffusion.diffusion_kv.request import DiffusionKVRequest
@@ -146,7 +145,7 @@ class QwenImage21LayoutTokenizer:
                     subfolder="processor",
                     trust_remote_code=trust_remote_code,
                 )
-            except Exception:
+            except (OSError, ValueError):
                 tokenizer = AutoTokenizer.from_pretrained(
                     model_or_tokenizer,
                     subfolder="tokenizer",
@@ -169,11 +168,11 @@ class QwenImage21LayoutTokenizer:
         num_images: int,
         max_sequence_length: int = QWEN_IMAGE_21_MAX_TEXT_LENGTH,
     ) -> str:
-        """Build the longest repeated-token prompt within the VLM token budget."""
+        """Build the longest repeated-token prompt within the user-text budget."""
 
         def tokenized_length(repetitions: int) -> int:
             prompt = (" dummy" * repetitions).strip()
-            return len(self._encode_raw(format_qwen_image_21_prompt(prompt, num_images)))
+            return self._budgeted_prompt_length(prompt, num_images)
 
         if tokenized_length(0) > max_sequence_length:
             raise ValueError(
@@ -190,18 +189,22 @@ class QwenImage21LayoutTokenizer:
             else:
                 high = mid
         prompt = (" dummy" * low).strip() or " "
-        current = len(self._encode_raw(format_qwen_image_21_prompt(prompt, num_images)))
+        current = self._budgeted_prompt_length(prompt, num_images)
         while current < max_sequence_length:
             candidates = []
             for suffix in ("x", " x", ".", "\n"):
                 candidate = prompt + suffix
-                candidate_len = len(self._encode_raw(format_qwen_image_21_prompt(candidate, num_images)))
+                candidate_len = self._budgeted_prompt_length(candidate, num_images)
                 if current < candidate_len <= max_sequence_length:
                     candidates.append((candidate_len, candidate))
             if not candidates:
                 break
             current, prompt = max(candidates)
         return prompt
+
+    def _budgeted_prompt_length(self, prompt: str, num_images: int) -> int:
+        raw_len = len(self._encode_raw(format_qwen_image_21_prompt(prompt, num_images)))
+        return max(0, raw_len - self.baseline_len)
 
     def _encode_raw(self, text: str) -> list[int]:
         out = self.tokenizer(text, add_special_tokens=False)
@@ -296,6 +299,7 @@ def prepare_qwen_image_21_layout(
     *,
     layout_tokenizer: QwenImage21LayoutTokenizer,
     vae_scale_factor: int = 16,
+    max_prompt_sequence_length: int | None = None,
 ) -> QwenImage21PreparedLayout:
     """Build the CPU token/image layout reused by Scheduler and Worker."""
 
@@ -315,6 +319,8 @@ def prepare_qwen_image_21_layout(
     target_len = target_token_height * target_token_width
 
     max_seq_len = int(sampling.max_sequence_length or QWEN_IMAGE_21_MAX_TEXT_LENGTH)
+    if max_prompt_sequence_length is not None:
+        max_seq_len = min(max_seq_len, int(max_prompt_sequence_length))
     cond_branch = layout_tokenizer.encode_branch(
         prompt_text,
         cache_branch="cond",
@@ -368,6 +374,7 @@ def build_qwen_image_21_diffusion_kv_requests(
             target_len=prepared_layout.target_len,
             seq_len=branch.seq_len,
             prompt_token_ids=None,
+            atomic_cache_spans=tuple((int(span.start or 0), int(span.stop or 0)) for span, _ in branch.image_spans),
             kv_contexts=(),
         )
         for sequence_id, branch in enumerate(prepared_layout.branches)
@@ -398,7 +405,7 @@ def _canonical_image_payload(
         vae_tensor = vae_images[idx]
         if not isinstance(vae_tensor, torch.Tensor):
             raise ValueError("Qwen-Image 2.1 reference-image prefix requires tensor vae_images")
-        prompt_item: Any = None
+        prompt_item: torch.Tensor | np.ndarray | None = None
         if isinstance(prompt_images, list | tuple) and idx < len(prompt_images):
             raw_prompt_img = prompt_images[idx]
             if isinstance(raw_prompt_img, PIL.Image.Image):
@@ -411,7 +418,7 @@ def _canonical_image_payload(
 
 
 def prepare_qwen_image_21_prefix_cache(request: OmniDiffusionRequest) -> None:
-    """Attach native MM identities / positions when Engine enables caching."""
+    """Attach image dependency identities and exact atomic cache spans."""
 
     layout = get_qwen_image_21_prepared_layout(request)
     if layout is None or not request.diffusion_kv_requests:
@@ -423,6 +430,7 @@ def prepare_qwen_image_21_prefix_cache(request: OmniDiffusionRequest) -> None:
         )
 
     num_images = len(layout.input_image_sizes)
+    layout_digest = hash_prefix_cache_value(("qwen-image-21-reference-layout-v1", layout.input_image_sizes)).hex()
     cumulative_image_digests: list[str] = []
     if num_images > 0:
         image_payloads = _canonical_image_payload(request, num_images)
@@ -438,13 +446,28 @@ def prepare_qwen_image_21_prefix_cache(request: OmniDiffusionRequest) -> None:
                 hash_prefix_cache_value(("qwen-image-21-reference-prefix-v1", per_image_digests[: idx + 1])).hex()
             )
 
-    prepared: list[tuple[DiffusionKVRequest, tuple[int, ...], list[MultiModalFeatureSpec], str]] = []
+    prepared: list[tuple[DiffusionKVRequest, tuple[int, ...], tuple[tuple[int, str], ...], str]] = []
     for row, branch in zip(request.diffusion_kv_requests, layout.branches, strict=True):
         if row.block_hashes or row.num_computed_tokens:
             raise ValueError("Qwen-Image 2.1 cache inputs must be prepared before KV execution")
         if len(branch.image_spans) != len(cumulative_image_digests):
             raise ValueError("Qwen-Image 2.1 reference-image prefix is missing its canonical inputs")
-        features: list[MultiModalFeatureSpec] = []
+        text_segments: list[tuple[int, ...]] = []
+        cursor = 0
+        for span, _ in branch.image_spans:
+            start = int(span.start or 0)
+            end = int(span.stop or 0)
+            text_segments.append(branch.tokens[cursor:start])
+            cursor = end
+        text_segments.append(branch.tokens[cursor : row.prefix_len])
+        text_digest = hash_prefix_cache_value(
+            (
+                "qwen-image-21-contextual-text-v1",
+                branch.cache_branch,
+                tuple(text_segments),
+            )
+        ).hex()
+        dependencies: list[tuple[int, str]] = [(0, text_digest)]
         for img_idx, (span, (token_h, token_w)) in enumerate(branch.image_spans):
             start = int(span.start or 0)
             end = int(span.stop or 0)
@@ -461,34 +484,27 @@ def prepare_qwen_image_21_prefix_cache(request: OmniDiffusionRequest) -> None:
                     cumulative_image_digests[img_idx],
                 )
             ).hex()
-            features.append(
-                MultiModalFeatureSpec(
-                    data=None,
-                    modality="image",
-                    identifier=identifier,
-                    mm_position=PlaceholderRange(offset=start, length=end - start),
-                )
-            )
+            dependencies.append((start, identifier))
         branch_namespace = get_cache_namespace(
-            f"qwen-image-21-primary-v1-{branch.cache_branch}",
+            f"qwen-image-21-primary-v1-{branch.cache_branch}-{layout_digest}",
             request.sampling_params,
         )
         prepared.append(
             (
                 row,
                 branch.tokens[: row.prefix_len],
-                sorted(features, key=lambda f: f.mm_position.offset),
+                tuple(dependencies),
                 branch_namespace,
             )
         )
 
-    for row, tokens, features, branch_namespace in prepared:
+    for row, tokens, dependencies, branch_namespace in prepared:
         row.cache_token_ids = tokens
-        row.mm_features = features
+        row.cache_dependencies = dependencies
         row.cache_namespace = branch_namespace
 
 
-def get_qwen_image_21_prepared_layout(source: Any) -> QwenImage21PreparedLayout | None:
+def get_qwen_image_21_prepared_layout(source: object) -> QwenImage21PreparedLayout | None:
     prepared_layout = getattr(source, "prepared_layout", None)
     if prepared_layout is None:
         return None

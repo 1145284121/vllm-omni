@@ -218,18 +218,20 @@ def get_qwen_image_21_pre_process_func(
                     float(request.sampling_params.true_cfg_scale or 1.0),
                     4.0,
                 )
-                if request.prompt.get("negative_prompt") is None:
-                    request.prompt["negative_prompt"] = ""
             if isinstance(request.prompt, dict) and request.prompt.get("prompt") == "dummy run":
                 request.sampling_params.max_sequence_length = profile_max_sequence_length
-                request.prompt["prompt"] = layout_tokenizer.build_profile_prompt(
+                profile_prompt = layout_tokenizer.build_profile_prompt(
                     num_images=len((request.prompt.get("additional_information") or {}).get("input_image_sizes") or ()),
                     max_sequence_length=profile_max_sequence_length,
                 )
+                request.prompt["prompt"] = profile_prompt
+                if max_rows >= 2:
+                    request.prompt["negative_prompt"] = profile_prompt
         prepared_layout = request_layout_utils.prepare_qwen_image_21_layout(
             request,
             layout_tokenizer=layout_tokenizer,
             vae_scale_factor=vae_scale_factor,
+            max_prompt_sequence_length=profile_max_sequence_length,
         )
         request.prepared_layout = prepared_layout
         request.diffusion_kv_requests = request_layout_utils.build_qwen_image_21_diffusion_kv_requests(

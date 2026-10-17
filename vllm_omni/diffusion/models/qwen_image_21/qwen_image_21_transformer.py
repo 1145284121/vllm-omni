@@ -9,11 +9,13 @@ import math
 import weakref
 from collections.abc import Iterable
 from contextlib import contextmanager
+from functools import wraps
 from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import vllm.envs as vllm_envs
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import RMSNorm
 from vllm.logger import init_logger
@@ -65,7 +67,8 @@ def _paged_kv_fp32_matmul_reduction(enabled: bool):
     depending on whether the token dimension M is >= 4096 or a multiple of 16,
     which otherwise causes warm prefix-sliced Step-0 linears (e.g. M=1120 vs
     M=9360) to diverge from cold prefill. Disabling internal BF16 reduction while
-    preserving the caller's Split-K setting makes linear outputs invariant to M.
+    preserving the caller's Split-K setting avoids that observed divergence on
+    the validated SM100 and SM120 execution shapes.
     """
     if not enabled:
         yield
@@ -85,6 +88,28 @@ def _paged_kv_fp32_matmul_reduction(enabled: bool):
         yield
     finally:
         matmul.allow_bf16_reduced_precision_reduction = prev
+
+
+@contextmanager
+def _vllm_batch_invariant_scope(enabled: bool):
+    if not enabled:
+        yield
+        return
+    previous = bool(vllm_envs.VLLM_BATCH_INVARIANT)
+    vllm_envs.VLLM_BATCH_INVARIANT = True
+    try:
+        yield
+    finally:
+        vllm_envs.VLLM_BATCH_INVARIANT = previous
+
+
+def _batch_invariant_forward(forward):
+    @wraps(forward)
+    def wrapped(self, *args, **kwargs):
+        with _vllm_batch_invariant_scope(getattr(self, "_batch_invariant_paged_hsdp_ulysses", False)):
+            return forward(self, *args, **kwargs)
+
+    return wrapped
 
 
 _FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
@@ -983,7 +1008,6 @@ class QwenImage21Transformer2DModel(CachedTransformer):
     ):
         super().__init__()
         self.parallel_config = od_config.parallel_config
-        self._nz_weights_supported = self._nz_weights_supported_for(od_config, quant_config)
         self.in_channels = in_channels
         self.out_channels = out_channels or in_channels
         self.patch_size = patch_size
@@ -994,11 +1018,17 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             getattr(od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
             is DiffusionKVCacheMode.PAGED_SCHEDULER
         )
+        self._batch_invariant_paged_hsdp_ulysses = bool(
+            uses_paged_kv
+            and getattr(self.parallel_config, "use_hsdp", False)
+            and int(getattr(self.parallel_config, "ulysses_degree", 1) or 1) > 1
+        )
         if uses_paged_kv and not (self.causal_condition and self.causal_block):
             raise ValueError(
                 "QwenImage21 paged_scheduler requires causal_condition=True and causal_block=True: "
                 "the fixed-timestep prefix must also be unable to attend to the dynamic target"
             )
+        self._nz_weights_supported = self._nz_weights_supported_for(od_config, quant_config)
         self.quant_config = _enable_pattern_ignored_layers(quant_config)
         quant_config = self.quant_config
         self._pointwise_contract_allowed = (
@@ -1087,9 +1117,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
                 "use native BF16 paged KV."
             )
         self.enable_cuda_graph_decode = (
-            getattr(od_config, "enable_cuda_graph_decode", True)
-            and not self._enforce_eager
-            and not uses_paged_kv
+            getattr(od_config, "enable_cuda_graph_decode", True) and not self._enforce_eager and not uses_paged_kv
         )
         # Ascend does not torch.compile this transformer. CUDA graph capture
         # also refuses non-CUDA devices, so a default graph manager still
@@ -1199,6 +1227,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             return "piecewise"
         return "mask"
 
+    @_batch_invariant_forward
     def forward(
         self,
         hidden_states: torch.Tensor,

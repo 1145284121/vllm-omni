@@ -66,10 +66,18 @@ def _layout_tokenizer() -> QwenImage21LayoutTokenizer:
     return QwenImage21LayoutTokenizer(_FakeCharTokenizer())
 
 
-def _make_ref_payloads(num_images: int = 2, *, fill: float = 0.25):
+def _make_ref_payloads(
+    num_images: int = 2,
+    *,
+    fill: float = 0.25,
+    input_image_sizes: list[tuple[int, int]] | None = None,
+):
+    input_image_sizes = input_image_sizes or [(64, 64) for _ in range(num_images)]
+    assert len(input_image_sizes) == num_images
     vae_images = [torch.full((1, 4, 1, 64, 64), fill + i, dtype=torch.float32) for i in range(num_images)]
-    input_image_sizes = [(64, 64) for _ in range(num_images)]
-    prompt_images = [PIL.Image.new("RGB", (64, 64), color=(int(50 + i * 20), 60, 70)) for i in range(num_images)]
+    prompt_images = [
+        PIL.Image.new("RGB", size, color=(int(50 + i * 20), 60, 70)) for i, size in enumerate(input_image_sizes)
+    ]
     return {
         "prompt_image": prompt_images,
         "vae_images": vae_images,
@@ -88,10 +96,13 @@ def _make_request(
     height: int = 64,
     width: int = 64,
     fill: float = 0.25,
+    input_image_sizes: list[tuple[int, int]] | None = None,
 ) -> OmniDiffusionRequest:
     prompt_dict: dict = {
         "prompt": prompt,
-        "additional_information": _make_ref_payloads(num_images, fill=fill) if num_images > 0 else {},
+        "additional_information": (
+            _make_ref_payloads(num_images, fill=fill, input_image_sizes=input_image_sizes) if num_images > 0 else {}
+        ),
     }
     if negative_prompt is not None:
         prompt_dict["negative_prompt"] = negative_prompt
@@ -194,9 +205,11 @@ def test_paged_preprocess_expands_startup_kv_profile_request(monkeypatch) -> Non
     assert profile_req.diffusion_kv_requests is not None
     assert len(profile_req.diffusion_kv_requests) == 2
     assert profile_req.diffusion_kv_requests[0].prefix_len > 4 * 4096
+    assert profile_req.diffusion_kv_requests[0].prefix_len == profile_req.diffusion_kv_requests[1].prefix_len
     assert profile_req.sampling_params.max_sequence_length == 8192
-    formatted_profile = layout_module.format_qwen_image_21_prompt(profile_req.prompt["prompt"], 4)
-    assert len(_layout_tokenizer()._encode_raw(formatted_profile)) == 8192
+    assert profile_req.prompt["negative_prompt"] == profile_req.prompt["prompt"]
+    profile_tokenizer = _layout_tokenizer()
+    assert profile_tokenizer._budgeted_prompt_length(profile_req.prompt["prompt"], 4) == 8192
 
     engine = DiffusionEngine.__new__(DiffusionEngine)
     engine._diffusion_kv_profile_limits = (
@@ -228,6 +241,40 @@ def test_paged_preprocess_validates_profile_text_budget(monkeypatch) -> None:
                 additional_config={"diffusion_kv_profile_max_sequence_length": 8193},
             )
         )
+
+    preprocess = get_qwen_image_21_pre_process_func(
+        SimpleNamespace(
+            model="model",
+            diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
+            diffusion_kv_max_rows_per_request=2,
+            additional_config={"diffusion_kv_profile_max_sequence_length": 512},
+        )
+    )
+    boundary_prompt = _layout_tokenizer().build_profile_prompt(num_images=0, max_sequence_length=512)
+    boundary = _make_request(
+        prompt=boundary_prompt,
+        negative_prompt=boundary_prompt,
+        true_cfg_scale=4.0,
+        num_images=0,
+    )
+    preprocess(boundary)
+    assert all(
+        branch.prefix_len == boundary.prepared_layout.branches[0].prefix_len
+        for branch in boundary.prepared_layout.branches
+    )
+
+    too_long = _make_request(prompt=boundary_prompt + "x", num_images=0)
+    with pytest.raises(ValueError, match=r"`prompt`.*max_sequence_length` is 512"):
+        preprocess(too_long)
+
+    negative_too_long = _make_request(
+        prompt="short",
+        negative_prompt=boundary_prompt + "x",
+        true_cfg_scale=4.0,
+        num_images=0,
+    )
+    with pytest.raises(ValueError, match=r"`negative_prompt`.*max_sequence_length` is 512"):
+        preprocess(negative_too_long)
 
 
 @pytest.mark.parametrize(
@@ -268,7 +315,7 @@ def test_system_prefix_dropped_and_images_expanded_4x() -> None:
 def prefix_cache_manager(request):
     native_kv_managers.register_all_kvcache_specs(None)
     spec = FullAttentionSpec(block_size=4, num_kv_heads=2, head_size=8, dtype=torch.bfloat16)
-    num_blocks = 128
+    num_blocks = 256
     config = KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=[build_kv_cache_tensor(spec, num_blocks, ["layer0"])],
@@ -276,9 +323,9 @@ def prefix_cache_manager(request):
     )
     manager = DiffusionKVCacheManager(
         config,
-        max_model_len=256,
+        max_model_len=512,
         scheduler_block_size=4,
-        hash_block_size=4,
+        hash_block_size=1,
         enable_prefix_caching=getattr(request, "param", True),
     )
     yield manager
@@ -319,7 +366,10 @@ def test_paged_cache_off_prepares_and_allocates_without_identity_work(
     )
     engine._prepare_request_for_admission(req)
     assert isinstance(req.prepared_layout, QwenImage21PreparedLayout)
-    assert all(row.cache_token_ids == () and row.mm_features == [] for row in req.diffusion_kv_requests)
+    assert all(
+        row.cache_token_ids == () and row.mm_features == [] and row.cache_dependencies == ()
+        for row in req.diffusion_kv_requests
+    )
     metadata = prefix_cache_manager.reserve_request(req.request_id, req.diffusion_kv_requests)
     assert metadata is not None
     assert all(row.cached_prefix_len == 0 for row in metadata.sequences)
@@ -347,15 +397,52 @@ def test_reference_content_is_hashed_once_across_cfg_rows(monkeypatch) -> None:
     # 2 reference images hashed once total across both CFG branches, while
     # positive and negative branches use isolated cache namespaces.
     assert sum(call.args[0][0] == "qwen-image-21-reference-v1" for call in hasher.call_args_list) == 2
-    assert len(req.diffusion_kv_requests[0].mm_features) == 2
-    assert req.diffusion_kv_requests[0].mm_features == req.diffusion_kv_requests[1].mm_features
+    assert len(req.diffusion_kv_requests[0].cache_dependencies) == 3
+    assert req.diffusion_kv_requests[0].cache_dependencies[0] != req.diffusion_kv_requests[1].cache_dependencies[0]
+    assert req.diffusion_kv_requests[0].cache_dependencies[1:] == req.diffusion_kv_requests[1].cache_dependencies[1:]
     assert req.diffusion_kv_requests[0].cache_namespace != req.diffusion_kv_requests[1].cache_namespace
+    layout_digest = layout_module.hash_prefix_cache_value(
+        ("qwen-image-21-reference-layout-v1", layout.input_image_sizes)
+    ).hex()
     assert req.diffusion_kv_requests[0].cache_namespace == kv_utils.get_cache_namespace(
-        "qwen-image-21-primary-v1-cond", req.sampling_params
+        f"qwen-image-21-primary-v1-cond-{layout_digest}", req.sampling_params
     )
     assert req.diffusion_kv_requests[1].cache_namespace == kv_utils.get_cache_namespace(
-        "qwen-image-21-primary-v1-uncond", req.sampling_params
+        f"qwen-image-21-primary-v1-uncond-{layout_digest}", req.sampling_params
     )
+
+
+@pytest.mark.parametrize("changed_num_images", [1, 4])
+def test_reference_image_count_change_isolates_prefix_namespace(
+    prefix_cache_manager: DiffusionKVCacheManager,
+    changed_num_images: int,
+) -> None:
+    tok = _layout_tokenizer()
+
+    def build(request_id: str, num_images: int) -> OmniDiffusionRequest:
+        req = _make_request(
+            prompt="edit the references",
+            negative_prompt="blurry",
+            true_cfg_scale=4.0,
+            num_images=num_images,
+            request_id=request_id,
+        )
+        layout = prepare_qwen_image_21_layout(req, layout_tokenizer=tok, vae_scale_factor=16)
+        req.prepared_layout = layout
+        req.diffusion_kv_requests = build_qwen_image_21_diffusion_kv_requests(req, layout)
+        prepare_qwen_image_21_prefix_cache(req)
+        return req
+
+    cold = build("cold-two", 2)
+    assert prefix_cache_manager.reserve_request("cold-two", cold.diffusion_kv_requests) is not None
+    prefix_cache_manager.publish_request("cold-two")
+    prefix_cache_manager.free_request("cold-two")
+
+    changed = build(f"changed-{changed_num_images}", changed_num_images)
+    metadata = prefix_cache_manager.reserve_request(changed.request_id, changed.diffusion_kv_requests)
+    assert metadata is not None
+    assert all(sequence.cached_prefix_len == 0 for sequence in metadata.sequences)
+    prefix_cache_manager.free_request(changed.request_id)
 
 
 def test_prefix_lookup_hits_full_partial_image_and_isolates_lora(
@@ -368,7 +455,9 @@ def test_prefix_lookup_hits_full_partial_image_and_isolates_lora(
         *,
         prompt: str = "replace the logo with AnchorCache",
         seed: int = 42,
-        change_img2: bool = False,
+        num_images: int = 2,
+        changed_image_idx: int | None = None,
+        input_image_sizes: list[tuple[int, int]] | None = None,
         lora_id: int | None = None,
         lora_scale: float = 1.0,
     ):
@@ -376,12 +465,13 @@ def test_prefix_lookup_hits_full_partial_image_and_isolates_lora(
             prompt=prompt,
             negative_prompt="blurry",
             true_cfg_scale=4.0,
-            num_images=2,
+            num_images=num_images,
             request_id=request_id,
             seed=seed,
+            input_image_sizes=input_image_sizes,
         )
-        if change_img2:
-            req.prompt["additional_information"]["vae_images"][1].fill_(9.0)
+        if changed_image_idx is not None:
+            req.prompt["additional_information"]["vae_images"][changed_image_idx].fill_(9.0)
         if lora_id is not None:
             req.sampling_params.lora_request = LoRARequest(
                 lora_name=f"adapter-{lora_id}",
@@ -402,7 +492,7 @@ def test_prefix_lookup_hits_full_partial_image_and_isolates_lora(
     prefix_cache_manager.publish_request("cold")
     prefix_cache_manager.free_request("cold")
 
-    # 1. Different seed with identical images and promptstill hits full common prefix.
+    # 1. Different seed with identical images and prompt still hits full common prefix.
     same_seed_diff = build("same-diff-seed", seed=999)
     meta_same = prefix_cache_manager.reserve_request("same-diff-seed", same_seed_diff.diffusion_kv_requests)
     assert meta_same is not None
@@ -411,24 +501,61 @@ def test_prefix_lookup_hits_full_partial_image_and_isolates_lora(
     assert native_kv_covers_cond_images(same_seed_diff.prepared_layout, meta_same.sequences[0].cached_prefix_len)
     prefix_cache_manager.free_request("same-diff-seed")
 
-    # 2. Edited instruction hits both reference images and covers cond images.
+    # 2. Contextual VLM text changes invalidate the complete contiguous prefix.
     edited = build("edited-prompt", prompt="turn the background dark blue")
     meta_edited = prefix_cache_manager.reserve_request("edited-prompt", edited.diffusion_kv_requests)
     assert meta_edited is not None
-    assert meta_edited.sequences[0].cached_prefix_len >= image_prefix_end
-    assert native_kv_covers_cond_images(edited.prepared_layout, meta_edited.sequences[0].cached_prefix_len)
+    assert all(sequence.cached_prefix_len == 0 for sequence in meta_edited.sequences)
     prefix_cache_manager.free_request("edited-prompt")
 
-    # 3. Changing only the second image still reuses the first image's span.
-    img2_changed = build("img2-changed", change_img2=True)
+    # 3. Changing only the second image reuses through the exact start of that
+    # image even though the boundary lies midway through a physical KV page.
+    img2_changed = build("img2-changed", changed_image_idx=1)
     meta_img2 = prefix_cache_manager.reserve_request("img2-changed", img2_changed.diffusion_kv_requests)
     assert meta_img2 is not None
-    first_img_end = cold_req.prepared_layout.branches[0].image_spans[0][0].stop
-    assert first_img_end <= meta_img2.sequences[0].cached_prefix_len < image_prefix_end
+    second_img_start = cold_req.prepared_layout.branches[0].image_spans[1][0].start
+    assert all(sequence.cached_prefix_len == second_img_start for sequence in meta_img2.sequences)
+    assert len(meta_img2.block_copies) == (0 if second_img_start % 4 == 0 else 2)
     assert not native_kv_covers_cond_images(img2_changed.prepared_layout, meta_img2.sequences[0].cached_prefix_len)
+    prefix_cache_manager.complete_block_copies("img2-changed")
     prefix_cache_manager.free_request("img2-changed")
 
-    # 4. Different LoRA adapter misses completely.
+    # 4. A different total image layout is isolated because Qwen's upstream
+    # condition representation is not invariant to image count or shape.
+    changed_layout = build(
+        "changed-layout",
+        input_image_sizes=[(32, 64), (96, 64)],
+    )
+    meta_changed_layout = prefix_cache_manager.reserve_request("changed-layout", changed_layout.diffusion_kv_requests)
+    assert meta_changed_layout is not None
+    assert all(sequence.cached_prefix_len == 0 for sequence in meta_changed_layout.sequences)
+    prefix_cache_manager.free_request("changed-layout")
+
+    # 5. Within one arbitrary layout, changing the final image reuses every
+    # preceding image independently of the concrete image shapes.
+    arbitrary_sizes = [(32, 64), (96, 64), (64, 32)]
+    cold_three = build("cold-three", num_images=3, input_image_sizes=arbitrary_sizes)
+    meta_cold_three = prefix_cache_manager.reserve_request("cold-three", cold_three.diffusion_kv_requests)
+    assert meta_cold_three is not None
+    prefix_cache_manager.publish_request("cold-three")
+    prefix_cache_manager.complete_block_copies("cold-three")
+    prefix_cache_manager.free_request("cold-three")
+
+    img3_changed = build(
+        "img3-changed",
+        num_images=3,
+        changed_image_idx=2,
+        input_image_sizes=arbitrary_sizes,
+    )
+    meta_img3 = prefix_cache_manager.reserve_request("img3-changed", img3_changed.diffusion_kv_requests)
+    assert meta_img3 is not None
+    third_img_start = cold_three.prepared_layout.branches[0].image_spans[2][0].start
+    assert all(sequence.cached_prefix_len == third_img_start for sequence in meta_img3.sequences)
+    assert len(meta_img3.block_copies) == (0 if third_img_start % 4 == 0 else 2)
+    prefix_cache_manager.complete_block_copies("img3-changed")
+    prefix_cache_manager.free_request("img3-changed")
+
+    # 6. Different LoRA adapter misses completely.
     lora_changed = build("lora-changed", lora_id=1, lora_scale=0.8)
     meta_lora = prefix_cache_manager.reserve_request("lora-changed", lora_changed.diffusion_kv_requests)
     assert meta_lora is not None
@@ -436,7 +563,7 @@ def test_prefix_lookup_hits_full_partial_image_and_isolates_lora(
     prefix_cache_manager.publish_request("lora-changed")
     prefix_cache_manager.free_request("lora-changed")
 
-    # 5. The same adapter and scale can reuse its own prefix, while changing
+    # 7. The same adapter and scale can reuse its own prefix, while changing
     # only the scale creates a distinct cache namespace.
     same_lora = build("same-lora", lora_id=1, lora_scale=0.8)
     meta_same_lora = prefix_cache_manager.reserve_request("same-lora", same_lora.diffusion_kv_requests)
@@ -452,7 +579,7 @@ def test_prefix_lookup_hits_full_partial_image_and_isolates_lora(
     assert all(seq.cached_prefix_len == 0 for seq in meta_lora_scale.sequences)
     prefix_cache_manager.free_request("lora-scale-changed")
 
-    # 6. Swapping positive and negative prompts in T2I does not cross-hit across
+    # 8. Swapping positive and negative prompts in T2I does not cross-hit across
     # cond/uncond branches (preventing uninitialized cross-rank reads under CFGP2).
     t2i_a = _make_request(
         prompt="bright studio portrait",
@@ -625,6 +752,8 @@ def test_prepare_generation_context_skips_vae_and_prompt_encode_on_prefix_hit() 
     assert pipe.prepare_latents.call_args.args[0] is None
     assert ctx["prompt_embeds"] is None
 
+
+def test_paged_kv_fp32_matmul_reduction_restores_backend_state() -> None:
     from vllm_omni.diffusion.models.qwen_image_21.qwen_image_21_transformer import (
         _paged_kv_fp32_matmul_reduction,
     )
@@ -645,10 +774,16 @@ def test_prepare_generation_context_skips_vae_and_prompt_encode_on_prefix_hit() 
         )
         for state in test_states:
             matmul.allow_bf16_reduced_precision_reduction = state
+            with _paged_kv_fp32_matmul_reduction(False):
+                assert bool(matmul.allow_bf16_reduced_precision_reduction) is bool(
+                    state[0] if isinstance(state, tuple) else state
+                )
             with _paged_kv_fp32_matmul_reduction(True):
                 assert bool(matmul.allow_bf16_reduced_precision_reduction) is False
                 if has_split_k and isinstance(state, tuple):
                     assert bool(matmul.allow_bf16_reduced_precision_reduction_split_k) is state[1]
+                with _paged_kv_fp32_matmul_reduction(True):
+                    assert bool(matmul.allow_bf16_reduced_precision_reduction) is False
             restored = (
                 (
                     bool(matmul.allow_bf16_reduced_precision_reduction),
