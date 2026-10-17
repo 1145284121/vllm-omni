@@ -452,22 +452,7 @@ def prepare_qwen_image_21_prefix_cache(request: OmniDiffusionRequest) -> None:
             raise ValueError("Qwen-Image 2.1 cache inputs must be prepared before KV execution")
         if len(branch.image_spans) != len(cumulative_image_digests):
             raise ValueError("Qwen-Image 2.1 reference-image prefix is missing its canonical inputs")
-        text_segments: list[tuple[int, ...]] = []
-        cursor = 0
-        for span, _ in branch.image_spans:
-            start = int(span.start or 0)
-            end = int(span.stop or 0)
-            text_segments.append(branch.tokens[cursor:start])
-            cursor = end
-        text_segments.append(branch.tokens[cursor : row.prefix_len])
-        text_digest = hash_prefix_cache_value(
-            (
-                "qwen-image-21-contextual-text-v1",
-                branch.cache_branch,
-                tuple(text_segments),
-            )
-        ).hex()
-        dependencies: list[tuple[int, str]] = [(0, text_digest)]
+        dependencies: list[tuple[int, str]] = []
         for img_idx, (span, (token_h, token_w)) in enumerate(branch.image_spans):
             start = int(span.start or 0)
             end = int(span.stop or 0)

@@ -397,9 +397,8 @@ def test_reference_content_is_hashed_once_across_cfg_rows(monkeypatch) -> None:
     # 2 reference images hashed once total across both CFG branches, while
     # positive and negative branches use isolated cache namespaces.
     assert sum(call.args[0][0] == "qwen-image-21-reference-v1" for call in hasher.call_args_list) == 2
-    assert len(req.diffusion_kv_requests[0].cache_dependencies) == 3
-    assert req.diffusion_kv_requests[0].cache_dependencies[0] != req.diffusion_kv_requests[1].cache_dependencies[0]
-    assert req.diffusion_kv_requests[0].cache_dependencies[1:] == req.diffusion_kv_requests[1].cache_dependencies[1:]
+    assert len(req.diffusion_kv_requests[0].cache_dependencies) == 2
+    assert req.diffusion_kv_requests[0].cache_dependencies == req.diffusion_kv_requests[1].cache_dependencies
     assert req.diffusion_kv_requests[0].cache_namespace != req.diffusion_kv_requests[1].cache_namespace
     layout_digest = layout_module.hash_prefix_cache_value(
         ("qwen-image-21-reference-layout-v1", layout.input_image_sizes)
@@ -501,11 +500,13 @@ def test_prefix_lookup_hits_full_partial_image_and_isolates_lora(
     assert native_kv_covers_cond_images(same_seed_diff.prepared_layout, meta_same.sequences[0].cached_prefix_len)
     prefix_cache_manager.free_request("same-diff-seed")
 
-    # 2. Contextual VLM text changes invalidate the complete contiguous prefix.
+    # 2. Prompt text follows the condition-image spans and must not invalidate
+    # their KV. The unchanged image prefix remains reusable across edits.
     edited = build("edited-prompt", prompt="turn the background dark blue")
     meta_edited = prefix_cache_manager.reserve_request("edited-prompt", edited.diffusion_kv_requests)
     assert meta_edited is not None
-    assert all(sequence.cached_prefix_len == 0 for sequence in meta_edited.sequences)
+    assert all(sequence.cached_prefix_len >= image_prefix_end for sequence in meta_edited.sequences)
+    assert native_kv_covers_cond_images(edited.prepared_layout, meta_edited.sequences[0].cached_prefix_len)
     prefix_cache_manager.free_request("edited-prompt")
 
     # 3. Changing only the second image reuses through the exact start of that
