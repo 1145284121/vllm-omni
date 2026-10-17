@@ -1498,9 +1498,11 @@ class QwenImage21Transformer2DModel(CachedTransformer):
                 dtype=hidden_states.dtype,
             )
 
-        if sp_active and not is_decode:
-            # Only target tokens feed proj_out under SP: the prefix is replicated on every
-            # rank and gathering it would duplicate it. Output is the (gathered) target image.
+        if (sp_active or paged_kv_active) and not is_decode:
+            # Only target tokens feed proj_out under SP or Scheduler-paged KV:
+            # the prefix is replicated across SP ranks, and slicing the prefix
+            # before norm_out/proj_out keeps the Step-0 output GEMM shape
+            # invariant to cached_prefix_len.
             joint_hidden_states = joint_hidden_states[:, uncached_prefix_len:]
             if local_mask is not None:
                 local_mask = local_mask[uncached_prefix_len:]

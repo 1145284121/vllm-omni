@@ -290,10 +290,18 @@ def test_reference_content_is_hashed_once_across_cfg_rows(monkeypatch) -> None:
     req.diffusion_kv_requests = build_qwen_image_21_diffusion_kv_requests(req, layout)
     prepare_qwen_image_21_prefix_cache(req)
 
-    # 2 reference images hashed once total across both CFG branches.
+    # 2 reference images hashed once total across both CFG branches, while
+    # positive and negative branches use isolated cache namespaces.
     assert sum(call.args[0][0] == "qwen-image-21-reference-v1" for call in hasher.call_args_list) == 2
     assert len(req.diffusion_kv_requests[0].mm_features) == 2
     assert req.diffusion_kv_requests[0].mm_features == req.diffusion_kv_requests[1].mm_features
+    assert req.diffusion_kv_requests[0].cache_namespace != req.diffusion_kv_requests[1].cache_namespace
+    assert req.diffusion_kv_requests[0].cache_namespace == kv_utils.get_cache_namespace(
+        "qwen-image-21-primary-v1-cond", req.sampling_params
+    )
+    assert req.diffusion_kv_requests[1].cache_namespace == kv_utils.get_cache_namespace(
+        "qwen-image-21-primary-v1-uncond", req.sampling_params
+    )
 
 
 def test_prefix_lookup_hits_full_partial_image_and_isolates_lora(
@@ -372,6 +380,108 @@ def test_prefix_lookup_hits_full_partial_image_and_isolates_lora(
     assert meta_lora is not None
     assert all(seq.cached_prefix_len == 0 for seq in meta_lora.sequences)
     prefix_cache_manager.free_request("lora-changed")
+
+    # 5. Swapping positive and negative prompts in T2I does not cross-hit across
+    # cond/uncond branches (preventing uninitialized cross-rank reads under CFGP2).
+    t2i_a = _make_request(
+        prompt="bright studio portrait",
+        negative_prompt="dark blurry grain",
+        true_cfg_scale=4.0,
+        num_images=0,
+        request_id="t2i-a",
+    )
+    t2i_a.prepared_layout = prepare_qwen_image_21_layout(t2i_a, layout_tokenizer=tok, vae_scale_factor=16)
+    t2i_a.diffusion_kv_requests = build_qwen_image_21_diffusion_kv_requests(t2i_a, t2i_a.prepared_layout)
+    prepare_qwen_image_21_prefix_cache(t2i_a)
+    meta_t2i_a = prefix_cache_manager.reserve_request("t2i-a", t2i_a.diffusion_kv_requests)
+    assert meta_t2i_a is not None
+    prefix_cache_manager.publish_request("t2i-a")
+    prefix_cache_manager.free_request("t2i-a")
+
+    t2i_swapped = _make_request(
+        prompt="dark blurry grain",
+        negative_prompt="bright studio portrait",
+        true_cfg_scale=4.0,
+        num_images=0,
+        request_id="t2i-swapped",
+    )
+    t2i_swapped.prepared_layout = prepare_qwen_image_21_layout(t2i_swapped, layout_tokenizer=tok, vae_scale_factor=16)
+    t2i_swapped.diffusion_kv_requests = build_qwen_image_21_diffusion_kv_requests(
+        t2i_swapped, t2i_swapped.prepared_layout
+    )
+    prepare_qwen_image_21_prefix_cache(t2i_swapped)
+    meta_t2i_swapped = prefix_cache_manager.reserve_request("t2i-swapped", t2i_swapped.diffusion_kv_requests)
+    assert meta_t2i_swapped is not None
+    # Only the shared user header ("<|im_start|>user\n", 17 chars -> 4 blocks = 16 tokens)
+    # may match within each branch's own namespace; the swapped prompt body must not cross-hit.
+    assert all(seq.cached_prefix_len < seq.prefix_len for seq in meta_t2i_swapped.sequences)
+    prefix_cache_manager.free_request("t2i-swapped")
+
+
+def test_sequential_cfg_prepares_single_branch_batches_without_two_row_prefill() -> None:
+    from contextlib import contextmanager
+
+    from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
+        DiffusionPagedAttentionMetadata,
+        DiffusionPagedAttentionRow,
+    )
+    from vllm_omni.diffusion.forward_context import set_forward_context
+    from vllm_omni.diffusion.models.qwen_image_21.cfg_parallel import (
+        QwenImage21CFGParallelMixin,
+        _set_denoise_step_idx,
+    )
+
+    row0 = DiffusionPagedAttentionRow(request_id="r", sequence_id=0, kv_start_pos=0, query_len=20518, seq_len=20518)
+    row1 = DiffusionPagedAttentionRow(request_id="r", sequence_id=1, kv_start_pos=0, query_len=20517, seq_len=20517)
+    metadata = DiffusionPagedAttentionMetadata(prefill_rows=(row0, row1), denoise_rows=(row0, row1))
+    prepared_batches: list[tuple[int, ...]] = []
+
+    class _FakeAdapter:
+        def prepare_batch(self, rows):
+            num_tokens = sum(r.query_len for r in rows)
+            if num_tokens > 32768:
+                raise ValueError(f"Paged attention batch has {num_tokens} tokens; Worker capacity is 32768")
+            seq_ids = tuple(r.sequence_id for r in rows)
+            prepared_batches.append(seq_ids)
+            return seq_ids
+
+        @contextmanager
+        def activate(self, batch):
+            yield batch
+
+    class _FakeRuntime:
+        def __init__(self) -> None:
+            self.metadata = metadata
+            self.adapter = _FakeAdapter()
+
+        def ensure_active(self, step_idx):
+            rows = self.metadata.rows_for_step(step_idx)
+            return self.adapter.prepare_batch(rows)
+
+        def _deactivate(self) -> None:
+            return None
+
+    class _FakePipe(QwenImage21CFGParallelMixin):
+        def predict_noise(self, **kwargs):
+            return kwargs["out"]
+
+        def combine_cfg_noise(self, pos, neg, scale, normalize):
+            del scale, normalize
+            return pos[0] + neg[0]
+
+    pipe = _FakePipe()
+    runtime = _FakeRuntime()
+    with set_forward_context(vllm_config=None, omni_diffusion_config=None, paged_kv_runtime=runtime):
+        _set_denoise_step_idx(0, sequential_cfg=True)
+        out = pipe.predict_noise_maybe_with_cfg(
+            do_true_cfg=True,
+            true_cfg_scale=4.0,
+            positive_kwargs={"out": torch.ones(1, 4, 2)},
+            negative_kwargs={"out": torch.ones(1, 4, 2)},
+            output_slice=2,
+        )
+    assert out.shape == (1, 2, 2)
+    assert prepared_batches == [(0,), (1,)]
 
 
 def test_prepare_generation_context_skips_vae_and_prompt_encode_on_prefix_hit() -> None:

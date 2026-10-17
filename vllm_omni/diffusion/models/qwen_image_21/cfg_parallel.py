@@ -62,6 +62,17 @@ def _paged_kv_branch_scope(sequence_id: int):
         yield
 
 
+def _set_denoise_step_idx(step_idx: int | None, *, sequential_cfg: bool = False) -> None:
+    if sequential_cfg and step_idx is not None and is_forward_context_available():
+        ctx = get_forward_context()
+        runtime = getattr(ctx, "paged_kv_runtime", None)
+        if runtime is not None and len(runtime.metadata.rows_for_step(step_idx)) > 1:
+            runtime._deactivate()
+            ctx.denoise_step_idx = step_idx
+            return
+    set_forward_context_denoise_step_idx(step_idx)
+
+
 class QwenImage21CFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
     """Base Mixin class for the Qwen-Image 2.1 pipeline providing shared CFG methods."""
 
@@ -168,12 +179,13 @@ class QwenImage21CFGParallelMixin(CFGParallelMixin, ProgressBarMixin):
             self.transformer.do_true_cfg = do_true_cfg
             additional_transformer_kwargs = additional_transformer_kwargs or {}
 
+            sequential_cfg = bool(do_true_cfg and _get_cfg_world_size_or_one() == 1)
             with self.progress_bar(total=len(timesteps)) as pbar:
                 for i, t in enumerate(timesteps):
                     if self.interrupt:
                         continue
                     self._current_timestep = t
-                    set_forward_context_denoise_step_idx(i)
+                    _set_denoise_step_idx(i, sequential_cfg=sequential_cfg)
 
                     # Broadcast timestep to match batch size
                     timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)

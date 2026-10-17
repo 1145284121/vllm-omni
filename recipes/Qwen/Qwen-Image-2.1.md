@@ -439,6 +439,8 @@ omni = Omni(
 )
 ```
 
+For 4-reference-image requests with `true_cfg_scale > 1.0` (~20.5k tokens per CFG branch at 1024×1024), single-rank CFG executes the positive and negative branches sequentially so `max_num_batched_tokens=32768` covers each branch's prefill pass; ensure the KV cache pool (`kv_cache_memory_bytes` or `gpu_memory_utilization`) can hold both branches (~21 GiB in BF16 on 1 GPU, or halved per rank under `cfg_parallel_size=2` / `tensor_parallel_size=2` / `ulysses_degree=2`).
+
 ## Quality Comparison (head vs diffusers)
 
 The reference is the diffusers Qwen-Image 2.1 pipeline

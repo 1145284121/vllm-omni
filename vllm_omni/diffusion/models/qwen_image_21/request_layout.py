@@ -398,8 +398,7 @@ def prepare_qwen_image_21_prefix_cache(request: OmniDiffusionRequest) -> None:
                 hash_prefix_cache_value(("qwen-image-21-reference-prefix-v1", per_image_digests[: idx + 1])).hex()
             )
 
-    namespace = get_cache_namespace("qwen-image-21-primary-v1", request.sampling_params)
-    prepared: list[tuple[DiffusionKVRequest, tuple[int, ...], list[MultiModalFeatureSpec]]] = []
+    prepared: list[tuple[DiffusionKVRequest, tuple[int, ...], list[MultiModalFeatureSpec], str]] = []
     for row, branch in zip(request.diffusion_kv_requests, layout.branches, strict=True):
         if row.block_hashes or row.num_computed_tokens:
             raise ValueError("Qwen-Image 2.1 cache inputs must be prepared before KV execution")
@@ -430,12 +429,23 @@ def prepare_qwen_image_21_prefix_cache(request: OmniDiffusionRequest) -> None:
                     mm_position=PlaceholderRange(offset=start, length=end - start),
                 )
             )
-        prepared.append((row, branch.tokens[: row.prefix_len], sorted(features, key=lambda f: f.mm_position.offset)))
+        branch_namespace = get_cache_namespace(
+            f"qwen-image-21-primary-v1-{branch.cache_branch}",
+            request.sampling_params,
+        )
+        prepared.append(
+            (
+                row,
+                branch.tokens[: row.prefix_len],
+                sorted(features, key=lambda f: f.mm_position.offset),
+                branch_namespace,
+            )
+        )
 
-    for row, tokens, features in prepared:
+    for row, tokens, features, branch_namespace in prepared:
         row.cache_token_ids = tokens
         row.mm_features = features
-        row.cache_namespace = namespace
+        row.cache_namespace = branch_namespace
 
 
 def get_qwen_image_21_prepared_layout(source: Any) -> QwenImage21PreparedLayout | None:
