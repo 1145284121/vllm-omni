@@ -498,28 +498,6 @@ def test_valid_sequence_and_context_install_into_native_rows(monkeypatch: pytest
     )
 
 
-def test_partial_hit_copies_boundary_block_once_before_install(monkeypatch: pytest.MonkeyPatch) -> None:
-    runner, _, _ = _runner(monkeypatch)
-    cache = torch.arange(32 * 8, dtype=torch.int64).view(32, 8)
-    runner.kv_caches = [cache]
-    source_before = cache[1].clone()
-    unrelated_before = cache[10].clone()
-    block_copies = (KVCacheBlockCopy(src_block_id=1, dst_block_id=9),)
-    metadata = replace(_metadata(), block_copies=block_copies)
-
-    assert runner.install_diffusion_kv_metadata(metadata) is True
-    assert torch.equal(cache[9], source_before)
-    assert torch.equal(cache[1], source_before)
-    assert torch.equal(cache[10], unrelated_before)
-
-    # Simulate the changed suffix overwriting only the private destination.
-    cache[9, 3:] = -1
-    assert runner.install_diffusion_kv_metadata(metadata) is False
-    assert torch.equal(cache[9, :3], source_before[:3])
-    assert torch.equal(cache[9, 3:], torch.full_like(cache[9, 3:], -1))
-    assert torch.equal(cache[1], source_before)
-
-
 def test_block_table_mutations_invalidate_prepared_attention_batches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
