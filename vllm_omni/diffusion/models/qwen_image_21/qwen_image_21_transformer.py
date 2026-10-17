@@ -990,6 +990,15 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         self.inner_dim = num_attention_heads * attention_head_dim
         self.causal_condition = causal_condition
         self.causal_block = causal_block
+        uses_paged_kv = (
+            getattr(od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+            is DiffusionKVCacheMode.PAGED_SCHEDULER
+        )
+        if uses_paged_kv and not (self.causal_condition and self.causal_block):
+            raise ValueError(
+                "QwenImage21 paged_scheduler requires causal_condition=True and causal_block=True: "
+                "the fixed-timestep prefix must also be unable to attend to the dynamic target"
+            )
         self.quant_config = _enable_pattern_ignored_layers(quant_config)
         quant_config = self.quant_config
         self._pointwise_contract_allowed = (
@@ -1072,12 +1081,6 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         # stay eligible only when that hook keeps weights on persistent
         # staging storage (see QwenImage21DecodeGraphManager._offload_reason).
         self._enforce_eager = bool(od_config.enforce_eager)
-        uses_paged_kv = (
-            getattr(od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
-            is DiffusionKVCacheMode.PAGED_SCHEDULER
-        )
-        if uses_paged_kv and not self.causal_condition:
-            raise ValueError("QwenImage21 paged_scheduler requires causal_condition=True")
         if uses_paged_kv and self.prefix_kv_cache_dtype is not None:
             raise ValueError(
                 "QwenImage21 paged_scheduler does not support extras['prefix_kv_cache_dtype']; "

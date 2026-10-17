@@ -163,6 +163,46 @@ class QwenImage21LayoutTokenizer:
         self.img_token_id = int(img_ids[0])
         self.baseline_len = len(self._encode_raw(PROMPT_TEMPLATE_T2I.format("")))
 
+    def build_profile_prompt(
+        self,
+        *,
+        num_images: int,
+        max_sequence_length: int = QWEN_IMAGE_21_MAX_TEXT_LENGTH,
+    ) -> str:
+        """Build the longest repeated-token prompt within the VLM token budget."""
+
+        def tokenized_length(repetitions: int) -> int:
+            prompt = (" dummy" * repetitions).strip()
+            return len(self._encode_raw(format_qwen_image_21_prompt(prompt, num_images)))
+
+        if tokenized_length(0) > max_sequence_length:
+            raise ValueError(
+                "Qwen-Image 2.1 prompt template exceeds the profile text budget: "
+                f"template_tokens={tokenized_length(0)}, max_sequence_length={max_sequence_length}"
+            )
+        low, high = 0, max_sequence_length + 1
+        if tokenized_length(high) <= max_sequence_length:
+            raise ValueError("Unable to construct a bounded Qwen-Image 2.1 profile prompt")
+        while low + 1 < high:
+            mid = (low + high) // 2
+            if tokenized_length(mid) <= max_sequence_length:
+                low = mid
+            else:
+                high = mid
+        prompt = (" dummy" * low).strip() or " "
+        current = len(self._encode_raw(format_qwen_image_21_prompt(prompt, num_images)))
+        while current < max_sequence_length:
+            candidates = []
+            for suffix in ("x", " x", ".", "\n"):
+                candidate = prompt + suffix
+                candidate_len = len(self._encode_raw(format_qwen_image_21_prompt(candidate, num_images)))
+                if current < candidate_len <= max_sequence_length:
+                    candidates.append((candidate_len, candidate))
+            if not candidates:
+                break
+            current, prompt = max(candidates)
+        return prompt
+
     def _encode_raw(self, text: str) -> list[int]:
         out = self.tokenizer(text, add_special_tokens=False)
         input_ids = out["input_ids"] if isinstance(out, dict) else out.input_ids

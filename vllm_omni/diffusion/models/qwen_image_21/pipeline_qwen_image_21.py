@@ -179,6 +179,18 @@ def get_qwen_image_21_pre_process_func(
     # opaque alpha channel unless the input already carries one.
     vae_image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor)
     sample_sigmas = (getattr(od_config, "extras", None) or {}).get("sample_sigmas")
+    additional_config = getattr(od_config, "additional_config", None) or {}
+    profile_max_sequence_length = int(
+        additional_config.get(
+            "diffusion_kv_profile_max_sequence_length",
+            request_layout_utils.QWEN_IMAGE_21_MAX_TEXT_LENGTH,
+        )
+    )
+    if not 0 < profile_max_sequence_length <= request_layout_utils.QWEN_IMAGE_21_MAX_TEXT_LENGTH:
+        raise ValueError(
+            "diffusion_kv_profile_max_sequence_length must be in "
+            f"[1, {request_layout_utils.QWEN_IMAGE_21_MAX_TEXT_LENGTH}], got {profile_max_sequence_length}"
+        )
     prepare_diffusion_kv_layout = (
         getattr(od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
         is DiffusionKVCacheMode.PAGED_SCHEDULER
@@ -209,7 +221,11 @@ def get_qwen_image_21_pre_process_func(
                 if request.prompt.get("negative_prompt") is None:
                     request.prompt["negative_prompt"] = ""
             if isinstance(request.prompt, dict) and request.prompt.get("prompt") == "dummy run":
-                request.prompt["prompt"] = ("dummy " * 512).strip()
+                request.sampling_params.max_sequence_length = profile_max_sequence_length
+                request.prompt["prompt"] = layout_tokenizer.build_profile_prompt(
+                    num_images=len((request.prompt.get("additional_information") or {}).get("input_image_sizes") or ()),
+                    max_sequence_length=profile_max_sequence_length,
+                )
         prepared_layout = request_layout_utils.prepare_qwen_image_21_layout(
             request,
             layout_tokenizer=layout_tokenizer,

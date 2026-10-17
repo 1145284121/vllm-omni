@@ -439,6 +439,18 @@ omni = Omni(
 )
 ```
 
+The startup memory profile defines the safe paged-KV admission envelope. By
+default it profiles 4 reference images, both CFG branches, an 8192-token VLM
+prompt budget, and a 1024x1024 target (4096 DiT target tokens). Requests may
+use other aspect ratios when their aligned target-token count does not exceed
+4096. To serve a larger target envelope, set
+`additional_config["diffusion_kv_profile_height"]`,
+`additional_config["diffusion_kv_profile_width"]`, and, when needed,
+`additional_config["diffusion_kv_profile_max_sequence_length"]`; increase
+`max_model_len` and the KV memory budget consistently. Requests outside the
+profiled sequence or target-token envelope are rejected before execution
+rather than risking an activation-memory OOM.
+
 For 4-reference-image requests with `true_cfg_scale > 1.0` (~20.5k tokens per CFG branch at 1024×1024), single-rank CFG executes the positive and negative branches sequentially so `max_num_batched_tokens=32768` covers each branch's prefill pass; ensure the KV cache pool (`kv_cache_memory_bytes` or `gpu_memory_utilization`) can hold both branches (~21 GiB in BF16 on 1 GPU, or halved per rank under `cfg_parallel_size=2` / `tensor_parallel_size=2` / `ulysses_degree=2`).
 
 ## Quality Comparison (head vs diffusers)

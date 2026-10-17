@@ -23,6 +23,9 @@ from vllm_omni.diffusion.models.qwen_image_21.pipeline_qwen_image_21 import (
     QwenImage21Pipeline,
     get_qwen_image_21_pre_process_func,
 )
+from vllm_omni.diffusion.models.qwen_image_21.qwen_image_21_transformer import (
+    QwenImage21Transformer2DModel,
+)
 from vllm_omni.diffusion.models.qwen_image_21.request_layout import (
     PROMPT_TEMPLATE_T2I,
     SYS_PROMPT,
@@ -191,6 +194,57 @@ def test_paged_preprocess_expands_startup_kv_profile_request(monkeypatch) -> Non
     assert profile_req.diffusion_kv_requests is not None
     assert len(profile_req.diffusion_kv_requests) == 2
     assert profile_req.diffusion_kv_requests[0].prefix_len > 4 * 4096
+    assert profile_req.sampling_params.max_sequence_length == 8192
+    formatted_profile = layout_module.format_qwen_image_21_prompt(profile_req.prompt["prompt"], 4)
+    assert len(_layout_tokenizer()._encode_raw(formatted_profile)) == 8192
+
+    engine = DiffusionEngine.__new__(DiffusionEngine)
+    engine._diffusion_kv_profile_limits = (
+        len(profile_req.diffusion_kv_requests),
+        max(row.seq_len for row in profile_req.diffusion_kv_requests),
+        max(row.target_len for row in profile_req.diffusion_kv_requests),
+    )
+    engine._validate_diffusion_kv_profile_limits(profile_req)
+
+    within = _make_request(prompt="wide image", num_images=0, height=768, width=1280)
+    preprocess(within)
+    engine._validate_diffusion_kv_profile_limits(within)
+
+    over_target = _make_request(prompt="slightly over one megapixel", num_images=0, height=864, width=1216)
+    preprocess(over_target)
+    with pytest.raises(ValueError, match=r"max_target_len=4104 \(profiled=4096\)"):
+        engine._validate_diffusion_kv_profile_limits(over_target)
+
+
+def test_paged_preprocess_validates_profile_text_budget(monkeypatch) -> None:
+    monkeypatch.setattr(pipeline_module, "_read_vae_scale_factor", lambda _cfg: 16)
+    monkeypatch.setattr(layout_module, "QwenImage21LayoutTokenizer", lambda *_args, **_kwargs: _layout_tokenizer())
+
+    with pytest.raises(ValueError, match="diffusion_kv_profile_max_sequence_length"):
+        get_qwen_image_21_pre_process_func(
+            SimpleNamespace(
+                model="model",
+                diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
+                additional_config={"diffusion_kv_profile_max_sequence_length": 8193},
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("causal_condition", "causal_block"),
+    [(False, True), (True, False), (False, False)],
+)
+def test_paged_transformer_requires_stable_causal_prefix(causal_condition: bool, causal_block: bool) -> None:
+    od_config = SimpleNamespace(
+        diffusion_kv_mode=DiffusionKVCacheMode.PAGED_SCHEDULER,
+        parallel_config=SimpleNamespace(),
+    )
+    with pytest.raises(ValueError, match="causal_condition=True and causal_block=True"):
+        QwenImage21Transformer2DModel(
+            od_config=od_config,
+            causal_condition=causal_condition,
+            causal_block=causal_block,
+        )
 
 
 def test_system_prefix_dropped_and_images_expanded_4x() -> None:
@@ -379,9 +433,26 @@ def test_prefix_lookup_hits_full_partial_image_and_isolates_lora(
     meta_lora = prefix_cache_manager.reserve_request("lora-changed", lora_changed.diffusion_kv_requests)
     assert meta_lora is not None
     assert all(seq.cached_prefix_len == 0 for seq in meta_lora.sequences)
+    prefix_cache_manager.publish_request("lora-changed")
     prefix_cache_manager.free_request("lora-changed")
 
-    # 5. Swapping positive and negative prompts in T2I does not cross-hit across
+    # 5. The same adapter and scale can reuse its own prefix, while changing
+    # only the scale creates a distinct cache namespace.
+    same_lora = build("same-lora", lora_id=1, lora_scale=0.8)
+    meta_same_lora = prefix_cache_manager.reserve_request("same-lora", same_lora.diffusion_kv_requests)
+    assert meta_same_lora is not None
+    assert all(seq.cached_prefix_len >= image_prefix_end for seq in meta_same_lora.sequences)
+    prefix_cache_manager.free_request("same-lora")
+
+    lora_scale_changed = build("lora-scale-changed", lora_id=1, lora_scale=0.9)
+    meta_lora_scale = prefix_cache_manager.reserve_request(
+        "lora-scale-changed", lora_scale_changed.diffusion_kv_requests
+    )
+    assert meta_lora_scale is not None
+    assert all(seq.cached_prefix_len == 0 for seq in meta_lora_scale.sequences)
+    prefix_cache_manager.free_request("lora-scale-changed")
+
+    # 6. Swapping positive and negative prompts in T2I does not cross-hit across
     # cond/uncond branches (preventing uninitialized cross-rank reads under CFGP2).
     t2i_a = _make_request(
         prompt="bright studio portrait",
