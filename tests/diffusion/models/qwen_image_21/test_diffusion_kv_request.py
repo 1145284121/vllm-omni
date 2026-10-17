@@ -558,7 +558,74 @@ def test_prepare_generation_context_skips_vae_and_prompt_encode_on_prefix_hit() 
         _paged_kv_fp32_matmul_reduction,
     )
 
-    prev = bool(torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction)
-    with _paged_kv_fp32_matmul_reduction(True):
-        assert torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction is False
-    assert bool(torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction) is prev
+    matmul = torch.backends.cuda.matmul
+    has_split_k = hasattr(matmul, "allow_bf16_reduced_precision_reduction_split_k")
+    orig_state: bool | tuple[bool, bool] = (
+        (
+            bool(matmul.allow_bf16_reduced_precision_reduction),
+            bool(matmul.allow_bf16_reduced_precision_reduction_split_k),
+        )
+        if has_split_k
+        else bool(matmul.allow_bf16_reduced_precision_reduction)
+    )
+    try:
+        test_states: list[bool | tuple[bool, bool]] = (
+            [(True, True), (False, True), (False, False)] if has_split_k else [True, False]
+        )
+        for state in test_states:
+            matmul.allow_bf16_reduced_precision_reduction = state
+            with _paged_kv_fp32_matmul_reduction(True):
+                assert bool(matmul.allow_bf16_reduced_precision_reduction) is False
+                if has_split_k and isinstance(state, tuple):
+                    assert bool(matmul.allow_bf16_reduced_precision_reduction_split_k) is state[1]
+            restored = (
+                (
+                    bool(matmul.allow_bf16_reduced_precision_reduction),
+                    bool(matmul.allow_bf16_reduced_precision_reduction_split_k),
+                )
+                if has_split_k
+                else bool(matmul.allow_bf16_reduced_precision_reduction)
+            )
+            assert restored == state
+
+            with pytest.raises(RuntimeError, match="boom"):
+                with _paged_kv_fp32_matmul_reduction(True):
+                    raise RuntimeError("boom")
+            restored_after_exc = (
+                (
+                    bool(matmul.allow_bf16_reduced_precision_reduction),
+                    bool(matmul.allow_bf16_reduced_precision_reduction_split_k),
+                )
+                if has_split_k
+                else bool(matmul.allow_bf16_reduced_precision_reduction)
+            )
+            assert restored_after_exc == state
+    finally:
+        matmul.allow_bf16_reduced_precision_reduction = orig_state
+
+    # Verify compatibility with older PyTorch versions where split_k attribute
+    # does not exist and the setter only accepts a bool.
+    class _LegacyMatmul:
+        def __init__(self, initial: bool) -> None:
+            self._val = initial
+
+        @property
+        def allow_bf16_reduced_precision_reduction(self) -> bool:
+            return self._val
+
+        @allow_bf16_reduced_precision_reduction.setter
+        def allow_bf16_reduced_precision_reduction(self, value: bool) -> None:
+            if not isinstance(value, bool):
+                raise RuntimeError(f"set_allow_bf16_reduction_cublas expects a bool, but got {type(value).__name__}")
+            self._val = value
+
+    real_matmul = torch.backends.cuda.matmul
+    try:
+        for legacy_init in (True, False):
+            legacy = _LegacyMatmul(legacy_init)
+            torch.backends.cuda.matmul = legacy  # type: ignore[assignment]
+            with _paged_kv_fp32_matmul_reduction(True):
+                assert legacy.allow_bf16_reduced_precision_reduction is False
+            assert legacy.allow_bf16_reduced_precision_reduction is legacy_init
+    finally:
+        torch.backends.cuda.matmul = real_matmul

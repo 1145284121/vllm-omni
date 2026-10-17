@@ -65,18 +65,26 @@ def _paged_kv_fp32_matmul_reduction(enabled: bool):
     depending on whether the token dimension M is >= 4096 or a multiple of 16,
     which otherwise causes warm prefix-sliced Step-0 linears (e.g. M=1120 vs
     M=9360) to diverge from cold prefill. Disabling internal BF16 reduction while
-    keeping Split-K reduction enabled makes linear outputs invariant to M.
+    preserving the caller's Split-K setting makes linear outputs invariant to M.
     """
     if not enabled:
         yield
         return
     matmul = torch.backends.cuda.matmul
-    prev = bool(matmul.allow_bf16_reduced_precision_reduction)
-    matmul.allow_bf16_reduced_precision_reduction = (False, True)
+    if hasattr(matmul, "allow_bf16_reduced_precision_reduction_split_k"):
+        prev: bool | tuple[bool, bool] = (
+            bool(matmul.allow_bf16_reduced_precision_reduction),
+            bool(matmul.allow_bf16_reduced_precision_reduction_split_k),
+        )
+        target: bool | tuple[bool, bool] = (False, prev[1])
+    else:
+        prev = bool(matmul.allow_bf16_reduced_precision_reduction)
+        target = False
+    matmul.allow_bf16_reduced_precision_reduction = target
     try:
         yield
     finally:
-        matmul.allow_bf16_reduced_precision_reduction = (True, True) if prev else (False, True)
+        matmul.allow_bf16_reduced_precision_reduction = prev
 
 
 _FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
