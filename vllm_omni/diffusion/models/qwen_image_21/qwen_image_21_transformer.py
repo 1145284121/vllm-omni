@@ -28,6 +28,7 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.base import CachedTransformer
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
@@ -541,6 +542,9 @@ class QwenImage21Attention(nn.Module):
             causal=False,
             num_kv_heads=self.num_kv_heads,
             impl_overrides={"SDPA": QwenImage21SDPAImpl} if quant_config is None else None,
+            prefix=prefix,
+            paged_kv_cache_role="primary",
+            paged_kv_cache_dtype=torch.bfloat16,
         )
 
     def _apply_rotary_emb(self, x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
@@ -858,7 +862,11 @@ class QwenImage21SequencePrepare(nn.Module):
         )
         repeats = torch.where(img_mask[0], 4, 1)
         joint_hidden_states = joint_hidden_states.repeat_interleave(repeats, dim=1)
-        joint_hidden_states[:, image_pad_mask] = hidden_states
+        if hidden_states.shape[1] == target_tokens and prefix_len > 0 and bool(image_pad_mask[:prefix_len].any()):
+            # Condition-image latents were skipped because their KV is already cached in the prefix.
+            joint_hidden_states[:, prefix_len:] = hidden_states
+        else:
+            joint_hidden_states[:, image_pad_mask] = hidden_states
 
         return (
             joint_hidden_states[:, :prefix_len],
@@ -1033,7 +1041,22 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         # stay eligible only when that hook keeps weights on persistent
         # staging storage (see QwenImage21DecodeGraphManager._offload_reason).
         self._enforce_eager = bool(od_config.enforce_eager)
-        self.enable_cuda_graph_decode = getattr(od_config, "enable_cuda_graph_decode", True) and not self._enforce_eager
+        uses_paged_kv = (
+            getattr(od_config, "diffusion_kv_mode", DiffusionKVCacheMode.DENSE_LEGACY)
+            is DiffusionKVCacheMode.PAGED_SCHEDULER
+        )
+        if uses_paged_kv and not self.causal_condition:
+            raise ValueError("QwenImage21 paged_scheduler requires causal_condition=True")
+        if uses_paged_kv and self.prefix_kv_cache_dtype is not None:
+            raise ValueError(
+                "QwenImage21 paged_scheduler does not support extras['prefix_kv_cache_dtype']; "
+                "use native BF16 paged KV."
+            )
+        self.enable_cuda_graph_decode = (
+            getattr(od_config, "enable_cuda_graph_decode", True)
+            and not self._enforce_eager
+            and not uses_paged_kv
+        )
         # Ascend does not torch.compile this transformer. CUDA graph capture
         # also refuses non-CUDA devices, so a default graph manager still
         # executes eagerly on NPU. NZ eligibility uses this fact directly.
@@ -1206,7 +1229,20 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             # The prefix is replicated across SP ranks for the Ulysses joint mechanism.
             ctx.split_text_embed_in_sp = False
 
-        is_decode = kv_cache is not None and len(kv_cache) > 0 and "key" in kv_cache[0].get(cache_branch, {})
+        paged_kv_active = self.transformer_blocks[0].attn.attn.is_paged_kv_active()
+        step_idx = getattr(ctx, "denoise_step_idx", None) if ctx is not None else None
+        paged_kv_cached_prefix_len = 0
+        if paged_kv_active:
+            if not self.causal_condition:
+                raise ValueError(
+                    "Scheduler-paged KV requires `causal_condition=True`. The cache is only valid because text and "
+                    "condition-image tokens modulate from t=0, which makes their activations step-independent."
+                )
+            is_decode = step_idx is not None and step_idx > 0
+            if not is_decode and ctx is not None:
+                paged_kv_cached_prefix_len = int(getattr(ctx, "paged_kv_cached_prefix_len", 0) or 0)
+        else:
+            is_decode = kv_cache is not None and len(kv_cache) > 0 and "key" in kv_cache[0].get(cache_branch, {})
 
         if is_decode and self._decode_graph_manager is not None:
             graph_output = self._decode_graph_manager.try_decode(
@@ -1222,11 +1258,6 @@ class QwenImage21Transformer2DModel(CachedTransformer):
                 if not return_dict:
                     return (graph_output,)
                 return Transformer2DModelOutput(sample=graph_output)
-
-        if is_decode:
-            txt_hidden_states = None
-        else:
-            txt_hidden_states = self.txt_in(encoder_hidden_states)
 
         geometry = None
         if (
@@ -1245,9 +1276,38 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             )
             geometry = self._geometry_for_request(kv_cache, img_mask, signature)
         self.sequence_prepare._request_geometry = geometry
-        prefix_hidden_states, target_hidden_states, prefix_freqs, target_freqs = self.sequence_prepare(
-            hidden_states, txt_hidden_states, layout, img_mask, is_decode
+
+        image_pad_mask = (
+            geometry["image_pad_mask"]
+            if geometry is not None and "image_pad_mask" in geometry
+            else self.sequence_prepare.expand_image_pad_mask(img_mask[0])
         )
+        target_tokens = math.prod(layout[-1])
+        prefix_len = image_pad_mask.shape[0] - target_tokens
+        if paged_kv_cached_prefix_len < 0 or paged_kv_cached_prefix_len > prefix_len:
+            raise ValueError(
+                f"Invalid paged_kv_cached_prefix_len={paged_kv_cached_prefix_len} for prefix_len={prefix_len}"
+            )
+
+        full_prefix_cached = paged_kv_active and not is_decode and paged_kv_cached_prefix_len == prefix_len
+        if is_decode or full_prefix_cached:
+            txt_hidden_states = None
+        else:
+            txt_hidden_states = self.txt_in(encoder_hidden_states)
+
+        prefix_hidden_states, target_hidden_states, prefix_freqs, target_freqs = self.sequence_prepare(
+            hidden_states, txt_hidden_states, layout, img_mask, is_decode or full_prefix_cached
+        )
+        if paged_kv_cached_prefix_len > 0 and not is_decode:
+            if not full_prefix_cached:
+                prefix_hidden_states = prefix_hidden_states[:, paged_kv_cached_prefix_len:]
+                prefix_freqs = prefix_freqs[paged_kv_cached_prefix_len:]
+            logger.debug(
+                "QwenImage21 prefix slice: cached_prefix_len=%d query_len=%d",
+                paged_kv_cached_prefix_len,
+                prefix_hidden_states.shape[1] + target_tokens,
+            )
+
         # Read SP pad size after sequence_prepare: the auto-pad hook only writes
         # ctx.sp_padding_size during the split inside that call (and once per
         # context). Reading earlier always sees 0 while the local shard is already
@@ -1264,14 +1324,9 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         # Local layout is always [prefix, target (shard)]: full sequence when SP is off.
         joint_hidden_states = torch.cat([prefix_hidden_states, target_hidden_states], dim=1)
         freqs = torch.cat([prefix_freqs, target_freqs], dim=0)
-        prefix_len = prefix_hidden_states.shape[1]
-        sp_prefix_len = prefix_len if sp_active and not is_decode else 0
+        uncached_prefix_len = prefix_hidden_states.shape[1]
+        sp_prefix_len = uncached_prefix_len if sp_active and not is_decode else 0
 
-        image_pad_mask = (
-            geometry["image_pad_mask"]
-            if geometry is not None
-            else self.sequence_prepare.expand_image_pad_mask(img_mask[0])
-        )
         if geometry is not None and "token_metadata" in geometry:
             image_ids, target_token_mask = geometry["token_metadata"]
         else:
@@ -1294,7 +1349,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         if modulation_mask is not None:
             local_mask = torch.cat(
                 [
-                    modulation_mask[:prefix_len],
+                    modulation_mask[prefix_len - uncached_prefix_len : prefix_len],
                     torch.ones(target_hidden_states.shape[1], dtype=torch.bool, device=modulation_mask.device),
                 ]
             )
@@ -1348,7 +1403,15 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         if is_decode:
             # Decode: block-causal degenerates to full attention for target rows; only key padding applies.
             if joint_key_valid is not None:
+                if paged_kv_active:
+                    raise ValueError("QwenImage21 paged_scheduler does not support padded prompt masks")
                 attn_metadata = AttentionMetadata(attn_mask=joint_key_valid)
+        elif paged_kv_active:
+            if has_padding:
+                raise ValueError("QwenImage21 paged_scheduler does not support padded prompt masks")
+            if self.causal_block:
+                spans = self._build_full_attn_spans(image_ids)
+                attn_metadata = AttentionMetadata(full_attn_spans=[list(spans) for _ in range(batch_size)])
         else:
             attn_path = self._resolve_attn_path(attn_path_hint, has_padding, sp_padding > 0)
             if kv_cache is not None:
@@ -1410,7 +1473,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
                 target_token_mask=local_mask,
                 attn_metadata=attn_metadata,
                 sp_prefix_len=sp_prefix_len,
-                sp_decode=sp_active and is_decode,
+                sp_decode=sp_active and is_decode and not paged_kv_active,
                 kv_cache=block_kv_cache,
                 cache_branch=cache_branch,
                 cache_write_len=cache_write_len,
@@ -1438,9 +1501,9 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         if sp_active and not is_decode:
             # Only target tokens feed proj_out under SP: the prefix is replicated on every
             # rank and gathering it would duplicate it. Output is the (gathered) target image.
-            joint_hidden_states = joint_hidden_states[:, prefix_len:]
+            joint_hidden_states = joint_hidden_states[:, uncached_prefix_len:]
             if local_mask is not None:
-                local_mask = local_mask[prefix_len:]
+                local_mask = local_mask[uncached_prefix_len:]
 
         joint_hidden_states = self.norm_out(joint_hidden_states, temb, local_mask)
         output = self.proj_out(joint_hidden_states)

@@ -24,6 +24,9 @@ class DiffusionModelMetadata:
     # Whether ``/v1/videos`` accepts the ``timeline_guides`` manifest plus
     # ``guide_files`` uploads, forwarded as ``multi_modal_data["timeline_guides"]``.
     supports_timeline_guides: bool = False
+    # Default DiT sequence-length ceiling used by ``paged_scheduler`` when the
+    # transformer config does not expose ``max_position_embeddings``.
+    default_max_model_len: int | None = None
 
 
 # FLUX.2 Klein supports up to four reference images.
@@ -31,6 +34,8 @@ FLUX2_KLEIN_MAX_INPUT_IMAGES = 4
 QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES = 4
 # Qwen-Image 2.1 image-conditioned generation caps condition images at 4.
 QWEN_IMAGE_21_MAX_INPUT_IMAGES = 4
+# 8192 text tokens + 4 condition images (4096 tokens each) + 1024x1024 target (4096 tokens).
+QWEN_IMAGE_21_DEFAULT_MAX_MODEL_LEN = 28672
 # Upstream HunyuanImage-3.0 "Multi-Image Fusion" caps reference images at 3.
 HUNYUAN_IMAGE3_MAX_INPUT_IMAGES = 3
 JOY_IMAGE_EDIT_MAX_INPUT_IMAGES = 1
@@ -53,6 +58,7 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
     "QwenImage21Pipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=QWEN_IMAGE_21_MAX_INPUT_IMAGES,
+        default_max_model_len=QWEN_IMAGE_21_DEFAULT_MAX_MODEL_LEN,
     ),
     "HunyuanImage3Pipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
