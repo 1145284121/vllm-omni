@@ -8,6 +8,7 @@ import copy
 import math
 import weakref
 from collections.abc import Iterable
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -54,6 +55,28 @@ class QwenImage21KVCache(list[dict[str, dict[str, torch.Tensor]]]):
     Plain lists cannot be weak-referenced. This subclass lets dropping a request
     release its geometry without retaining prefix tensors on the transformer.
     """
+
+
+@contextmanager
+def _paged_kv_fp32_matmul_reduction(enabled: bool):
+    """Keep cuBLAS BF16 GEMM reduction in FP32 across Step-0 prefix-slice lengths.
+
+    On Blackwell sm_120, cuBLAS switches between FP32 and BF16 internal reduction
+    depending on whether the token dimension M is >= 4096 or a multiple of 16,
+    which otherwise causes warm prefix-sliced Step-0 linears (e.g. M=1120 vs
+    M=9360) to diverge from cold prefill. Disabling internal BF16 reduction while
+    keeping Split-K reduction enabled makes linear outputs invariant to M.
+    """
+    if not enabled:
+        yield
+        return
+    matmul = torch.backends.cuda.matmul
+    prev = bool(matmul.allow_bf16_reduced_precision_reduction)
+    matmul.allow_bf16_reduced_precision_reduction = (False, True)
+    try:
+        yield
+    finally:
+        matmul.allow_bf16_reduced_precision_reduction = (True, True) if prev else (False, True)
 
 
 _FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
@@ -1464,51 +1487,52 @@ class QwenImage21Transformer2DModel(CachedTransformer):
                 pointwise_validated = pointwise_eligible(
                     joint_hidden_states, prepared_modulation[1], prepared_modulation[3]
                 )
-        for index_block, block in enumerate(self.transformer_blocks):
-            block_kv_cache = kv_cache[index_block] if kv_cache is not None else None
-            joint_hidden_states = block(
-                hidden_states=joint_hidden_states,
-                modulation=modulation,
-                freqs=freqs,
-                target_token_mask=local_mask,
-                attn_metadata=attn_metadata,
-                sp_prefix_len=sp_prefix_len,
-                sp_decode=sp_active and is_decode and not paged_kv_active,
-                kv_cache=block_kv_cache,
-                cache_branch=cache_branch,
-                cache_write_len=cache_write_len,
-                prepared_modulation=prepared_modulation,
-                _pointwise_validated=pointwise_validated,
-            )
+        with _paged_kv_fp32_matmul_reduction(paged_kv_active and hidden_states.device.type == "cuda"):
+            for index_block, block in enumerate(self.transformer_blocks):
+                block_kv_cache = kv_cache[index_block] if kv_cache is not None else None
+                joint_hidden_states = block(
+                    hidden_states=joint_hidden_states,
+                    modulation=modulation,
+                    freqs=freqs,
+                    target_token_mask=local_mask,
+                    attn_metadata=attn_metadata,
+                    sp_prefix_len=sp_prefix_len,
+                    sp_decode=sp_active and is_decode and not paged_kv_active,
+                    kv_cache=block_kv_cache,
+                    cache_branch=cache_branch,
+                    cache_write_len=cache_write_len,
+                    prepared_modulation=prepared_modulation,
+                    _pointwise_validated=pointwise_validated,
+                )
 
-        if (
-            not is_decode
-            and cache_write_len is not None
-            and kv_cache is not None
-            and self._decode_graph_manager is not None
-        ):
-            # Allocate graph scratch buffers; the request keeps its own prefix K/V.
-            self._decode_graph_manager.register_prefill(
-                kv_cache=kv_cache,
-                cache_branch=cache_branch,
-                prefix_len=cache_write_len,
-                img_shapes=layout,
-                target_freqs=target_freqs,
-                joint_key_valid=joint_key_valid,
-                dtype=hidden_states.dtype,
-            )
+            if (
+                not is_decode
+                and cache_write_len is not None
+                and kv_cache is not None
+                and self._decode_graph_manager is not None
+            ):
+                # Allocate graph scratch buffers; the request keeps its own prefix K/V.
+                self._decode_graph_manager.register_prefill(
+                    kv_cache=kv_cache,
+                    cache_branch=cache_branch,
+                    prefix_len=cache_write_len,
+                    img_shapes=layout,
+                    target_freqs=target_freqs,
+                    joint_key_valid=joint_key_valid,
+                    dtype=hidden_states.dtype,
+                )
 
-        if (sp_active or paged_kv_active) and not is_decode:
-            # Only target tokens feed proj_out under SP or Scheduler-paged KV:
-            # the prefix is replicated across SP ranks, and slicing the prefix
-            # before norm_out/proj_out keeps the Step-0 output GEMM shape
-            # invariant to cached_prefix_len.
-            joint_hidden_states = joint_hidden_states[:, uncached_prefix_len:]
-            if local_mask is not None:
-                local_mask = local_mask[uncached_prefix_len:]
+            if (sp_active or paged_kv_active) and not is_decode:
+                # Only target tokens feed proj_out under SP or Scheduler-paged KV:
+                # the prefix is replicated across SP ranks, and slicing the prefix
+                # before norm_out/proj_out keeps the Step-0 output GEMM shape
+                # invariant to cached_prefix_len.
+                joint_hidden_states = joint_hidden_states[:, uncached_prefix_len:]
+                if local_mask is not None:
+                    local_mask = local_mask[uncached_prefix_len:]
 
-        joint_hidden_states = self.norm_out(joint_hidden_states, temb, local_mask)
-        output = self.proj_out(joint_hidden_states)
+            joint_hidden_states = self.norm_out(joint_hidden_states, temb, local_mask)
+            output = self.proj_out(joint_hidden_states)
 
         if not return_dict:
             return (output,)

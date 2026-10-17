@@ -553,3 +553,12 @@ def test_prepare_generation_context_skips_vae_and_prompt_encode_on_prefix_hit() 
     assert pipe.encode_prompt.call_count == 0
     assert pipe.prepare_latents.call_args.args[0] is None
     assert ctx["prompt_embeds"] is None
+
+    from vllm_omni.diffusion.models.qwen_image_21.qwen_image_21_transformer import (
+        _paged_kv_fp32_matmul_reduction,
+    )
+
+    prev = bool(torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction)
+    with _paged_kv_fp32_matmul_reduction(True):
+        assert torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction is False
+    assert bool(torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction) is prev
