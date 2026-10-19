@@ -102,6 +102,24 @@ def _batch_invariant_forward(forward):
     return wrapped
 
 
+def _validate_paged_prompt_mask(
+    joint_key_valid: torch.Tensor | None,
+    sp_padding: int,
+) -> None:
+    """Reject real prompt padding while ignoring synthetic SP tail tokens."""
+
+    if joint_key_valid is None:
+        return
+    prompt_len = joint_key_valid.shape[-1] - sp_padding
+    if prompt_len < 0:
+        raise ValueError(
+            f"QwenImage21 SP padding exceeds the joint key mask: padding={sp_padding}, "
+            f"sequence={joint_key_valid.shape[-1]}"
+        )
+    if not bool(joint_key_valid[..., :prompt_len].all()):
+        raise ValueError("QwenImage21 paged_scheduler does not support padded prompt masks")
+
+
 _FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 
 # Accepted values for the `prefix_kv_cache_dtype` switch (see QwenImage21Transformer2DModel).
@@ -1455,13 +1473,12 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         cache_write_len: int | None = None
         if is_decode:
             # Decode: block-causal degenerates to full attention for target rows; only key padding applies.
-            if joint_key_valid is not None:
-                if paged_kv_active:
-                    raise ValueError("QwenImage21 paged_scheduler does not support padded prompt masks")
+            if paged_kv_active:
+                _validate_paged_prompt_mask(joint_key_valid, sp_padding)
+            elif joint_key_valid is not None:
                 attn_metadata = AttentionMetadata(attn_mask=joint_key_valid)
         elif paged_kv_active:
-            if has_padding:
-                raise ValueError("QwenImage21 paged_scheduler does not support padded prompt masks")
+            _validate_paged_prompt_mask(joint_key_valid, sp_padding)
             if self.causal_block:
                 spans = self._build_full_attn_spans(image_ids)
                 attn_metadata = AttentionMetadata(full_attn_spans=[list(spans) for _ in range(batch_size)])

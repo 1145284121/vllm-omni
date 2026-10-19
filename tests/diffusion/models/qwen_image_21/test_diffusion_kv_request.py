@@ -25,6 +25,7 @@ from vllm_omni.diffusion.models.qwen_image_21.pipeline_qwen_image_21 import (
 )
 from vllm_omni.diffusion.models.qwen_image_21.qwen_image_21_transformer import (
     QwenImage21Transformer2DModel,
+    _validate_paged_prompt_mask,
 )
 from vllm_omni.diffusion.models.qwen_image_21.request_layout import (
     PROMPT_TEMPLATE_T2I,
@@ -292,6 +293,18 @@ def test_paged_transformer_requires_stable_causal_prefix(causal_condition: bool,
             causal_condition=causal_condition,
             causal_block=causal_block,
         )
+
+
+def test_paged_prompt_mask_distinguishes_prompt_and_sp_padding() -> None:
+    sp_only = torch.tensor([[True, True, True, True, False, False, False, False]])
+    _validate_paged_prompt_mask(sp_only, sp_padding=4)
+
+    actual_prompt_padding = torch.tensor([[True, True, False, True, False, False, False, False]])
+    with pytest.raises(ValueError, match="padded prompt masks"):
+        _validate_paged_prompt_mask(actual_prompt_padding, sp_padding=4)
+
+    with pytest.raises(ValueError, match="SP padding exceeds"):
+        _validate_paged_prompt_mask(torch.ones(1, 3, dtype=torch.bool), sp_padding=4)
 
 
 def test_system_prefix_dropped_and_images_expanded_4x() -> None:
